@@ -6,6 +6,8 @@ import joblib
 import json
 import tensorflow as tf
 import plotly.graph_objects as go
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ============================================================
@@ -295,6 +297,77 @@ st.markdown(
 
 
 # ============================================================
+# HTTP HELPERS: RETRIES AND CACHED LOCATION LOOKUPS
+# ============================================================
+
+@st.cache_resource
+def get_http_session():
+    """Reuse an HTTP session and retry temporary upstream failures."""
+    session = requests.Session()
+    retry_policy = Retry(
+        total=3,
+        connect=3,
+        read=2,
+        status=3,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_policy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode_location(city):
+    """Cache successful OpenStreetMap location searches for one hour."""
+    response = get_http_session().get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": city.strip(), "format": "json", "limit": 1},
+        headers={"User-Agent": "AI-Wind-Energy-Forecasting-App/1.0"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, list):
+        raise ValueError("Location service returned an unexpected response.")
+    return data
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_weather(latitude, longitude, feature_string):
+    """Cache successful hourly weather responses for 15 minutes."""
+    response = get_http_session().get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": latitude,
+            "longitude": longitude,
+            "hourly": feature_string,
+            "forecast_days": 1,
+            "timezone": "auto",
+        },
+        timeout=30,
+    )
+
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After")
+        message = "Open-Meteo is rate-limiting requests (HTTP 429)."
+        if retry_after:
+            message += f" Retry-After: {retry_after}."
+        message += " Wait a few minutes and try again."
+        raise RuntimeError(message)
+
+    response.raise_for_status()
+    data = response.json()
+    if "hourly" not in data:
+        raise ValueError(f"Weather API response did not contain hourly data: {data}")
+    return data
+
+
+# ============================================================
 # LOAD PRODUCTION MODEL AND FILES
 # ============================================================
 
@@ -525,29 +598,12 @@ if predict_button:
         st.stop()
 
     # ========================================================
-    # STEP 1: GEOCODING
+    # STEP 1: GEOCODING (cached)
     # ========================================================
-
-    geocode_url = "https://nominatim.openstreetmap.org/search"
-    geocode_params = {
-        "q": city.strip(),
-        "format": "json",
-        "limit": 1,
-    }
-    headers = {
-        "User-Agent": "AI-Wind-Energy-Forecasting-App"
-    }
 
     with st.spinner(f"Finding {city.strip()}..."):
         try:
-            geo_response = requests.get(
-                geocode_url,
-                params=geocode_params,
-                headers=headers,
-                timeout=10,
-            )
-            geo_response.raise_for_status()
-            geo_data = geo_response.json()
+            geo_data = geocode_location(city.strip())
 
             if not geo_data:
                 st.error(f"Could not find location: {city}")
@@ -564,13 +620,11 @@ if predict_button:
             st.stop()
 
     # ========================================================
-    # STEP 2: GET WEATHER DATA FROM OPEN-METEO
+    # STEP 2: GET WEATHER DATA FROM OPEN-METEO (cached)
     # ========================================================
 
-    weather_url = "https://api.open-meteo.com/v1/forecast"
-
-    # Open-Meteo API variable names do not include units.
-    # They are renamed to the exact training column names below.
+    # These are the Open-Meteo API variable names. They are renamed
+    # later to match the exact feature names used during model training.
     api_features = [
         "temperature_2m",
         "relative_humidity_2m",
@@ -585,25 +639,23 @@ if predict_button:
         "wind_speed_100m",
     ]
 
-    weather_params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "hourly": ",".join(api_features),
-        "forecast_days": 1,
-        "timezone": "auto",
-    }
-
     with st.spinner("Retrieving hourly weather and preparing the forecast..."):
         try:
-            weather_response = requests.get(
-                weather_url,
-                params=weather_params,
-                timeout=15,
+            # Round coordinates to 4 decimals to improve cache reuse.
+            weather_data = fetch_weather(
+                round(latitude, 4),
+                round(longitude, 4),
+                ",".join(api_features),
             )
-            weather_response.raise_for_status()
-            weather_data = weather_response.json()
-        except requests.RequestException as e:
-            st.error(f"Weather API request failed. Please try again. Details: {e}")
+        except RuntimeError as e:
+            st.error(str(e))
+            st.info(
+                "If this continues, check Open-Meteo service status and usage limits. "
+                "A retry or cache cannot bypass an active rate limit."
+            )
+            st.stop()
+        except (requests.RequestException, ValueError) as e:
+            st.error(f"Could not retrieve weather data: {e}")
             st.stop()
 
     # ========================================================
